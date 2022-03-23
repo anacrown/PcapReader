@@ -9,8 +9,6 @@ using PacketDotNet;
 using PcapngUtils;
 using PcapngUtils.Common;
 using Serilog;
-using Serilog.Context;
-using Serilog.Core;
 using File = System.IO.File;
 
 namespace PcapReader
@@ -22,7 +20,21 @@ namespace PcapReader
 
         static void Main(string[] args)
         {
-            var dir = @"D:\_NH\Online 20211216\12.16-3";
+            var dir = @"D:\R\2";
+            var sslkeylogfile = Path.Combine(dir, "SSLKEYLOGFILE.txt");
+            var pcapng = Directory.GetFiles(dir, "*.pcapng").SingleOrDefault();
+
+            if (pcapng == null)
+            {
+                Log.Error("File .pcapng not found or not single");
+                return;
+            }
+
+            if (!File.Exists(sslkeylogfile))
+            {
+                Log.Error("File SSLKEYLOGFILE.txt not found");
+                return;
+            }
 
             Log.Logger = new LoggerConfiguration()
                 .Enrich.WithAssemblyName()
@@ -34,35 +46,63 @@ namespace PcapReader
                 .WriteTo.File("log.txt", rollingInterval: RollingInterval.Day)
                 .WriteTo.Seq("http://localhost:5341")
                 .CreateLogger();
-
-            var pcapng = Directory.GetFiles(dir, "*.pcapng").SingleOrDefault();
-            if (pcapng == null)
-            {
-                Log.Error("File .pcapng not fount or not single");
-                return;
-            }
-
+           
             using var reader = IReaderFactory.GetReader(pcapng);
             {
                 reader.OnReadPacketEvent += ReaderOnOnReadPacketEvent;
                 reader.ReadPackets(CancellationToken.None);
                 reader.OnReadPacketEvent -= ReaderOnOnReadPacketEvent;
             }
-
+            
             Log.Information("ClientHello sessions {Count}", sessions.Count);
+            if (File.Exists(sslkeylogfile))
+            {
+                foreach (var key in File.ReadAllLines(sslkeylogfile)
+                    .Where(l => l.StartsWith("CLIENT_RANDOM"))
+                    .Select(l => l.Split(' ').Last().Trim())
+                    .Reverse())
+                {
+                    if (sessions.ContainsKey(key)) continue;
+
+                    sessions.Add(key, default);
+                    Log.Information("CLIENT_RANDOM: {Key}", key);
+                }
+            }
 
             Parallel.ForEach(Directory.GetFiles(dir, "*.DMP"), file =>
             {
                 var bytes = ByteArrayToString(File.ReadAllBytes(file), false);
                 Log.Information("File loaded {File}", Path.GetFileName(file));
 
+                var txtFile = $"{Path.GetFileNameWithoutExtension(file)}.txt";
+                File.WriteAllText(Path.Combine(dir, txtFile), bytes);
+                Log.Information("File saved {TXTFile}", Path.GetFileName(txtFile));
+
                 Parallel.ForEach(sessions, session =>
                 {
                     var offset = bytes.IndexOf(session.Key, StringComparison.Ordinal);
-                    if (offset > -1)
-                        Log.Information("{File} : {SessionId} {No} {SourceAddress} {DestinationAddress} {IndexOf}", Path.GetFileName(file), session.Key, session.Value.no, session.Value.packet.SourceAddress, session.Value.packet.DestinationAddress, offset);
+                    if (offset <= -1) return;
+
+                    offset /= 2;
+
+                    if (session.Value != default)
+                        Log.Information("{File} : {SessionId} {No} {SourceAddress} {DestinationAddress} {IndexOf}",
+                            Path.GetFileName(file), session.Key, session.Value.no,
+                            session.Value.packet.SourceAddress,
+                            session.Value.packet.DestinationAddress, offset.ToString("X4"));
+                    else
+                        Log.Information("{File} : {SessionId} {IndexOf}", Path.GetFileName(file), session.Key,
+                            offset.ToString("X4"));
                 });
 
+                // var pattern = new Regex("300000(.{96})200000");
+                // Parallel.ForEach(sessions, session =>
+                // {
+                //     foreach (Match match in pattern.Matches(bytes))
+                //     {
+                //         Log.Information("{File} [FOUNT BY REGEX] : {SessionId} 0x{IndexOf}", Path.GetFileName(file), match.Groups[1].Value, match.Index.ToString("X4"));
+                //     }
+                // });
             });
         }
 
