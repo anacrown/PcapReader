@@ -16,11 +16,26 @@ namespace PcapReader
     class Program
     {
         private static long No = 0;
-        private static Dictionary<string, (long no, IPv4Packet packet)> sessions = new Dictionary<string, (long no, IPv4Packet packet)>();
+
+        private static Dictionary<string, (long no, IPv4Packet packet, byte[] sessionId)> sessions =
+            new Dictionary<string, (long no, IPv4Packet packet, byte[] sessionId)>();
 
         static void Main(string[] args)
         {
-            var dir = @"D:\R\2";
+            var dir = @"D:\R\1";
+
+            Log.Logger = new LoggerConfiguration()
+                .Enrich.WithAssemblyName()
+                .Enrich.WithAssemblyVersion()
+                .Enrich.WithMemoryUsage()
+                .Enrich.WithProperty("Guid", Guid.NewGuid())
+                .Enrich.WithProperty("Root", dir)
+                .WriteTo.Console()
+                .WriteTo.File("log.txt", rollingInterval: RollingInterval.Day)
+                .WriteTo.Seq("http://localhost:5341")
+                .MinimumLevel.Debug()
+                .CreateLogger();
+
             var sslkeylogfile = Path.Combine(dir, "SSLKEYLOGFILE.txt");
             var pcapng = Directory.GetFiles(dir, "*.pcapng").SingleOrDefault();
 
@@ -36,74 +51,96 @@ namespace PcapReader
                 return;
             }
 
-            Log.Logger = new LoggerConfiguration()
-                .Enrich.WithAssemblyName()
-                .Enrich.WithAssemblyVersion()
-                .Enrich.WithMemoryUsage()
-                .Enrich.WithProperty("Guid", Guid.NewGuid())
-                .Enrich.WithProperty("Root", dir)
-                .WriteTo.Console()
-                .WriteTo.File("log.txt", rollingInterval: RollingInterval.Day)
-                .WriteTo.Seq("http://localhost:5341")
-                .CreateLogger();
-           
             using var reader = IReaderFactory.GetReader(pcapng);
             {
                 reader.OnReadPacketEvent += ReaderOnOnReadPacketEvent;
                 reader.ReadPackets(CancellationToken.None);
                 reader.OnReadPacketEvent -= ReaderOnOnReadPacketEvent;
             }
-            
-            Log.Information("ClientHello sessions {Count}", sessions.Count);
-            if (File.Exists(sslkeylogfile))
-            {
-                foreach (var key in File.ReadAllLines(sslkeylogfile)
-                    .Where(l => l.StartsWith("CLIENT_RANDOM"))
-                    .Select(l => l.Split(' ').Last().Trim())
-                    .Reverse())
-                {
-                    if (sessions.ContainsKey(key)) continue;
-
-                    sessions.Add(key, default);
-                    Log.Information("CLIENT_RANDOM: {Key}", key);
-                }
-            }
 
             Parallel.ForEach(Directory.GetFiles(dir, "*.DMP"), file =>
             {
-                var bytes = ByteArrayToString(File.ReadAllBytes(file), false);
-                Log.Information("File loaded {File}", Path.GetFileName(file));
-
-                var txtFile = $"{Path.GetFileNameWithoutExtension(file)}.txt";
-                File.WriteAllText(Path.Combine(dir, txtFile), bytes);
-                Log.Information("File saved {TXTFile}", Path.GetFileName(txtFile));
-
-                Parallel.ForEach(sessions, session =>
+                try
                 {
-                    var offset = bytes.IndexOf(session.Key, StringComparison.Ordinal);
-                    if (offset <= -1) return;
+                    // var bytes = ByteArrayToString(File.ReadAllBytes(file), false);
+                    // Log.Information("File loaded {File}", Path.GetFileName(file));
 
-                    offset /= 2;
+                    Parallel.ForEach(sessions, session =>
+                    {
 
-                    if (session.Value != default)
-                        Log.Information("{File} : {SessionId} {No} {SourceAddress} {DestinationAddress} {IndexOf}",
-                            Path.GetFileName(file), session.Key, session.Value.no,
-                            session.Value.packet.SourceAddress,
-                            session.Value.packet.DestinationAddress, offset.ToString("X4"));
-                    else
-                        Log.Information("{File} : {SessionId} {IndexOf}", Path.GetFileName(file), session.Key,
-                            offset.ToString("X4"));
-                });
-
-                // var pattern = new Regex("300000(.{96})200000");
-                // Parallel.ForEach(sessions, session =>
-                // {
-                //     foreach (Match match in pattern.Matches(bytes))
-                //     {
-                //         Log.Information("{File} [FOUNT BY REGEX] : {SessionId} 0x{IndexOf}", Path.GetFileName(file), match.Groups[1].Value, match.Index.ToString("X4"));
-                //     }
-                // });
+                        try
+                        {
+                            foreach (var offset in Find(file, session.Key, session.Value.sessionId))
+                            {
+                                Log.Information("{File} : {SessionId} {No} {SourceAddress} {DestinationAddress} {IndexOf}", Path.GetFileName(file), session.Key, session.Value.no, session.Value.packet.SourceAddress, session.Value.packet.DestinationAddress, offset);
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            Log.Error(e, e.Message);
+                        }
+                    });
+                }
+                catch (Exception e)
+                {
+                    Log.Error(e, e.Message);
+                }
             });
+        }
+
+        private static IEnumerable<long> Find(string file, string sessionId, byte[] arr)
+        {
+
+            var stream = File.OpenRead(file);
+            stream.Seek(0, SeekOrigin.Begin);
+            Log.Debug("Find {SessionId} in file {File}", sessionId, Path.GetFileName(file));
+
+            if (arr.Length == 0 || stream.Length < arr.Length)
+                yield break;
+
+            var buff = new byte[arr.Length];
+            try
+            {
+                var read = stream.Read(buff);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e);
+                throw;
+            }
+
+            while (true)
+            {
+                if (stream.Position - buff.Length == 0x210)
+                {
+                    int a = 0 + 12;
+                }
+
+                var found = true;
+                for (int i = 0; i < buff.Length; i++)
+                {
+                    if (arr[i] != buff[i])
+                    {
+                        found = false;
+                        break;
+                    }
+                }
+
+#if DEBUG
+                //var strByff = ByteArrayToString(buff);
+                //Log.Information("Buffer {buffer} offset {offset} found {found}", strByff, stream.Position-buff.Length, found);
+#endif
+
+                if (found)
+                    yield return stream.Position - buff.Length;
+
+                for (int i = 1; i < buff.Length; i++)
+                    buff[i - 1] = buff[i];
+
+                var b = stream.ReadByte();
+                if (b == -1) yield break;
+                buff[buff.Length - 1] = (byte)b;
+            }
         }
 
         private static void ReaderOnOnReadPacketEvent(object context, IPacket packet)
@@ -126,10 +163,10 @@ namespace PcapReader
             Array.Copy(body, 44, sessionId, 0, 32);
 
             var strSessionId = ByteArrayToString(sessionId, false);
-            // Console.WriteLine($"{No}: SessionId {strSessionId} {ipv4p.SourceAddress} {ipv4p.DestinationAddress}");
+            Log.Debug("{No}: SessionId {strSessionId} {ipv4p.SourceAddress} {ipv4p.DestinationAddress}", No, strSessionId, ipv4p.SourceAddress, ipv4p.DestinationAddress);
 
             if (!sessions.ContainsKey(strSessionId))
-                sessions.Add(strSessionId, (No, ipv4p));
+                sessions.Add(strSessionId, (No, ipv4p, sessionId));
         }
 
         static long Get(byte[] b, int offset, int length)
@@ -161,12 +198,12 @@ namespace PcapReader
                 {
                     hex.Append(" ");
 
-                    if (counter == 8)
-                        hex.Append(" ");
+                    // if (counter == 8)
+                    //     hex.Append(" ");
 
                     if (counter == 16)
                     {
-                        hex.Append(Environment.NewLine);
+                        //hex.Append(Environment.NewLine);
                         counter = 0;
                     }
                 }
